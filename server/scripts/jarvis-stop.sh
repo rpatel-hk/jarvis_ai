@@ -1,11 +1,11 @@
 #!/bin/bash
-U=gui/$(id -u)
-for s in com.jarvis.voice com.jarvis.dashboard; do launchctl bootout $U/$s 2>/dev/null; done
+# Linux: stop the systemd user services, then clear anything still holding our ports
+# (catches orphaned STT children whose cmdline doesn't contain "server.py").
+# Note: leaves jarvis-gateway (Hermes) running, matching the original macOS script.
+systemctl --user stop jarvis-voice jarvis-dashboard 2>/dev/null
 sleep 2
-# kill anything still holding our ports (catches orphaned STT children whose
-# cmdline doesn't contain "server.py")
 for port in 443 8765 8766 9443; do
-  lsof -ti tcp:$port -sTCP:LISTEN 2>/dev/null | xargs kill -9 2>/dev/null
+  fuser -k -n tcp "$port" >/dev/null 2>&1
 done
 pkill -9 -if "server\.py" 2>/dev/null
 echo "stopped (ports cleared)"
