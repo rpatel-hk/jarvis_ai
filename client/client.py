@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Windows LAN voice client for the Hermes voice pipeline.
+"""LAN voice client (Windows/Linux) for the Hermes voice pipeline.
 
 Captures 16 kHz mono PCM, runs openWakeWord locally unless push-to-talk is used,
 streams audio to the Mac server, and plays returned audio through the default
@@ -232,20 +232,39 @@ async def wake_word_loop(
     ws,
     audio_q: queue.Queue[bytes],
     stop_event: asyncio.Event,
+    turn_complete: asyncio.Event,
     output_device: int | None,
     wake_word: str,
     threshold: float,
     max_record_seconds: float,
+    silence_ms: int,
+    speech_rms: float,
+    no_speech_seconds: float,
 ) -> None:
     if WakeWordModel is None:
-        print("openWakeWord could not be imported. Run with --push-to-talk or reinstall requirements-client.txt.")
+        print("openWakeWord could not be imported. Run with --push-to-talk or reinstall: pip install openwakeword")
         stop_event.set()
         return
 
-    print(f"Loading openWakeWord model for stock wake word: {wake_word}")
-    print("To swap later, pass --wake-word NAME if your installed openWakeWord package includes that model, or update this script to load a custom .onnx model.")
-    model = WakeWordModel(wakeword_models=[wake_word])
-    print("Listening for wake word. Press Ctrl+C to exit.")
+    def flush_audio() -> None:
+        while True:
+            try:
+                audio_q.get_nowait()
+            except queue.Empty:
+                return
+
+    print(f"Loading openWakeWord model: {wake_word}")
+    try:
+        model = WakeWordModel(wakeword_models=[wake_word])
+    except Exception:
+        # openWakeWord >= 0.6 ships without model files; fetch them once.
+        from openwakeword import utils as oww_utils
+        print("Downloading openWakeWord models (one time)...")
+        oww_utils.download_models()
+        model = WakeWordModel(wakeword_models=[wake_word])
+    print(f"Listening for '{wake_word}'. Press Ctrl+C to exit.")
+
+    silence_chunks_needed = max(1, int(silence_ms / CHUNK_MS))
 
     while not stop_event.is_set():
         try:
@@ -255,22 +274,52 @@ async def wake_word_loop(
 
         frame = np.frombuffer(chunk, dtype=np.int16)
         prediction = model.predict(frame)
-        score = float(prediction.get(wake_word, 0.0))
+        score = max((float(v) for k, v in prediction.items() if wake_word in k), default=0.0)
         if score < threshold:
             continue
 
-        print(f"Wake word detected ({wake_word}, score {score:.2f}). Streaming for up to {max_record_seconds:.1f}s, press Ctrl+C to exit.")
+        print(f"Wake word detected (score {score:.2f}). Listening...")
         play_beep(output_device)
+        flush_audio()  # drop audio captured during the beep
+        turn_complete.clear()
         await ws.send(json.dumps({"type": "start", "sample_rate": SAMPLE_RATE, "format": "pcm_s16le", "channels": CHANNELS}))
+
+        # Stream until the speaker goes quiet (end of speech), or hits a limit.
         start = time.perf_counter()
-        while time.perf_counter() - start < max_record_seconds and not stop_event.is_set():
+        heard_speech = False
+        quiet_chunks = 0
+        while not stop_event.is_set():
+            elapsed = time.perf_counter() - start
+            if elapsed >= max_record_seconds:
+                break
+            if not heard_speech and elapsed >= no_speech_seconds:
+                print("No speech heard; cancelling.")
+                break
             try:
                 speech_chunk = await asyncio.to_thread(audio_q.get, True, 0.2)
             except queue.Empty:
                 continue
             await ws.send(speech_chunk)
+            samples = np.frombuffer(speech_chunk, dtype=np.int16).astype(np.float32)
+            rms = float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
+            if rms >= speech_rms:
+                heard_speech = True
+                quiet_chunks = 0
+            elif heard_speech:
+                quiet_chunks += 1
+                if quiet_chunks >= silence_chunks_needed:
+                    break
         await ws.send(json.dumps({"type": "stop"}))
-        print("Utterance sent. Waiting for response audio...")
+        print("Utterance sent. Waiting for the reply...")
+
+        # Don't listen while Jarvis is thinking/speaking, or it can wake itself up.
+        try:
+            await asyncio.wait_for(turn_complete.wait(), timeout=240)
+        except asyncio.TimeoutError:
+            print("No reply within 240s; listening again.")
+        flush_audio()
+        model.reset()
+        print(f"Listening for '{wake_word}'...")
 
 
 def parse_args() -> argparse.Namespace:
@@ -282,7 +331,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--push-to-talk", action="store_true", help="bypass wake word; press Enter to start and stop streaming")
     parser.add_argument("--wake-word", default=DEFAULT_WAKE_WORD, help=f"openWakeWord stock model name, default {DEFAULT_WAKE_WORD}")
     parser.add_argument("--wake-threshold", type=float, default=0.55, help="wake detection threshold")
-    parser.add_argument("--max-record-seconds", type=float, default=8.0, help="maximum utterance length after wake word")
+    parser.add_argument("--max-record-seconds", type=float, default=20.0, help="maximum utterance length after wake word")
+    parser.add_argument("--silence-ms", type=int, default=900, help="stop recording after this much silence once speech has started")
+    parser.add_argument("--speech-rms", type=float, default=500.0, help="loudness that counts as speech (raise if background noise keeps it recording)")
+    parser.add_argument("--no-speech-seconds", type=float, default=4.0, help="cancel if no speech is heard this long after the wake word")
     return parser.parse_args()
 
 
@@ -340,10 +392,14 @@ async def main_async() -> int:
                         ws,
                         audio_q,
                         stop_event,
+                        turn_complete,
                         args.output_device,
                         args.wake_word,
                         args.wake_threshold,
                         args.max_record_seconds,
+                        args.silence_ms,
+                        args.speech_rms,
+                        args.no_speech_seconds,
                     )
                     await player
     except OSError as exc:
