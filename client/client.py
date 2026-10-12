@@ -254,14 +254,16 @@ async def wake_word_loop(
                 return
 
     print(f"Loading openWakeWord model: {wake_word}")
+    # ONNX runtime works on every platform; the default (tflite) has no wheels
+    # for Python 3.12+, which is what Ubuntu 24.04 ships.
     try:
-        model = WakeWordModel(wakeword_models=[wake_word])
+        model = WakeWordModel(wakeword_models=[wake_word], inference_framework="onnx")
     except Exception:
         # openWakeWord >= 0.6 ships without model files; fetch them once.
         from openwakeword import utils as oww_utils
         print("Downloading openWakeWord models (one time)...")
         oww_utils.download_models()
-        model = WakeWordModel(wakeword_models=[wake_word])
+        model = WakeWordModel(wakeword_models=[wake_word], inference_framework="onnx")
     print(f"Listening for '{wake_word}'. Press Ctrl+C to exit.")
 
     silence_chunks_needed = max(1, int(silence_ms / CHUNK_MS))
