@@ -1173,6 +1173,12 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                     conn.recording = False
                     conn.timing.end_of_speech_monotonic = time.perf_counter()
                     conn.turn_task = asyncio.create_task(_run_turn(ws, pipeline, conn))
+                elif etype == "cancel":
+                    # HUD wake word heard nothing after "hey jarvis": drop the audio quietly
+                    conn.recording = False
+                    conn.audio_chunks = []
+                    conn.timing = None
+                    await ws.send_json({"type": "status", "message": "Turn cancelled."})
                 elif etype == "stop_run":
                     await _cancel_active_turn(ws, pipeline, conn)
                     await ws.send_json({"type": "agent_status", "state": "stopped"})
@@ -1202,6 +1208,98 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     finally:
         WS_CLIENTS.discard(ws)
 
+
+
+# --------------------------------------------------------------- Wake word
+# Browser HUD streams idle mic audio here; we run openWakeWord and tell the tab
+# when "hey jarvis" is heard, and the tab then starts a normal /ws turn.
+
+_WAKE_LOCK = threading.Lock()
+_WAKE_READY: bool | None = None   # None = not tried yet
+
+
+def _wake_cfg() -> dict:
+    w = CFG.get("wake") or {}
+    return {
+        "model": str(w.get("model", "hey_jarvis")),
+        "threshold": float(w.get("threshold", 0.55)),
+    }
+
+
+def _new_wake_model():
+    """Load an openWakeWord model (ONNX runtime: works on Python 3.12+)."""
+    global _WAKE_READY
+    from openwakeword.model import Model as WakeModel  # optional dependency
+    name = _wake_cfg()["model"]
+    with _WAKE_LOCK:
+        try:
+            model = WakeModel(wakeword_models=[name], inference_framework="onnx")
+        except Exception:
+            from openwakeword import utils as oww_utils
+            print(f"Downloading openWakeWord model '{name}' (one time)...", flush=True)
+            oww_utils.download_models([name])
+            model = WakeModel(wakeword_models=[name], inference_framework="onnx")
+        _WAKE_READY = True
+    return model
+
+
+def _wake_score(model, frame: np.ndarray) -> float:
+    name = _wake_cfg()["model"]
+    pred = model.predict(frame)
+    return max((float(v) for k, v in pred.items() if name in k), default=0.0)
+
+
+@app.websocket("/wake")
+async def wake_endpoint(ws: WebSocket) -> None:
+    if not _ws_allowed(ws):
+        await ws.close(code=4401)
+        return
+    await ws.accept()
+    try:
+        model = await asyncio.to_thread(_new_wake_model)
+    except Exception as exc:
+        msg = ("Wake word unavailable on the server: "
+               f"{type(exc).__name__}: {exc}. Run linux/install-hud-wakeword.sh.")
+        print(msg, flush=True)
+        await ws.send_json({"type": "wake_error", "message": msg})
+        await ws.close(code=4500)
+        return
+    threshold = _wake_cfg()["threshold"]
+    await ws.send_json({"type": "wake_ready", "model": _wake_cfg()["model"], "threshold": threshold})
+    cooldown_until = 0.0
+    pending = bytearray()
+    try:
+        while True:
+            message = await ws.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+            if message.get("text"):
+                try:
+                    event = json.loads(message["text"])
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "reset":
+                    pending.clear()
+                    await asyncio.to_thread(model.reset)
+                continue
+            data = message.get("bytes")
+            if not data:
+                continue
+            pending.extend(data)
+            # openWakeWord wants 80 ms frames (1280 samples of int16)
+            while len(pending) >= 2560:
+                frame = np.frombuffer(bytes(pending[:2560]), dtype=np.int16)
+                del pending[:2560]
+                score = await asyncio.to_thread(_wake_score, model, frame)
+                now = time.monotonic()
+                if score >= threshold and now >= cooldown_until:
+                    cooldown_until = now + 2.0
+                    pending.clear()
+                    await asyncio.to_thread(model.reset)
+                    print(f"Wake word detected (score {score:.2f})", flush=True)
+                    await ws.send_json({"type": "wake", "score": round(score, 3)})
+    except WebSocketDisconnect:
+        pass
 
 def main() -> int:
     server = CFG["server"]

@@ -60,6 +60,10 @@ server:
     port: 9443
     target: http://127.0.0.1:9119
 
+wake:                        # HUD "Hey Jarvis" wake word (needs linux/install-hud-wakeword.sh)
+  model: hey_jarvis
+  threshold: 0.55            # higher = fewer false wakes, lower = more sensitive (don't go below ~0.45)
+
 security:
   hud_token_env: JARVIS_HUD_TOKEN   # set in ~/.hermes/.env; unset = auth disabled
   extra_origin_hosts: []            # e.g. ["192.168.1.10"] if you open the HUD by raw IP

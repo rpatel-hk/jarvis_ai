@@ -84,6 +84,8 @@ button.btn.danger{color:var(--red); border-color:#7a2a33; background:#240a0e}
 button.btn.danger:hover{background:#3a0e15; box-shadow:0 0 10px #ff4d5e55}
 button.btn.amber{color:var(--amber); border-color:#7a5a1a; background:#241c0a}
 #stopBtn{display:none}
+button.btn.wake{width:100%; margin-top:6px; color:var(--cyan-dim)}
+button.btn.wake.on{color:var(--teal); border-color:var(--teal); box-shadow:0 0 10px #19f0d855}
 #approvals{position:absolute; top:8px; left:50%; transform:translateX(-50%); z-index:20; width:min(560px,92%); display:flex; flex-direction:column; gap:8px}
 .appr{border:1px solid var(--amber); background:#1a1305f2; padding:12px 14px;
   box-shadow:0 0 24px #ffb30044; animation:apprIn .25s ease-out}
@@ -266,6 +268,7 @@ footer{
         <button class="btn" id="talkBtn" style="flex:1">ENGAGE VOICE</button>
         <button class="btn danger" id="stopBtn">■ STOP</button>
       </div>
+      <button class="btn wake" id="wakeBtn" title="Listen for “Hey Jarvis” while this tab is open">○ WAKE WORD: OFF</button>
     </div>
     <div class="panel"><h2><span>AGENT ACTIVITY</span><span class="num">02</span></h2>
       <div id="activity"><div>— no activity yet —</div></div>
@@ -366,6 +369,13 @@ let ws=null, wsReady=false, capturing=false, state="standby";
 let audioCtx=null, workletNode=null, mediaStream=null, srcNode=null;
 let playhead=0, activeSources=[], leftoverByte=null, audioArrived=false;
 let level=0, turns=0;
+/* wake word ("Hey Jarvis"): idle mic audio goes to /wake; a detection starts a normal turn */
+const WAKE_SPEECH_RMS=500;     // loudness that counts as speech (raise if noise keeps it recording)
+const WAKE_SILENCE_MS=900;     // send after this much silence once you've started talking
+const WAKE_NO_SPEECH_MS=5000;  // give up if you say nothing after the wake word
+const WAKE_MAX_MS=20000;       // hard cap on one utterance
+const WAKE_IGNORE_MS=300;      // ignore the start beep when detecting speech
+let wakeWs=null, wakeArmed=false, wakeOpen=false, wakeStreaming=false, wakeFails=0, autoTurn=null;
 
 const $=id=>document.getElementById(id);
 const feed=$("feed");
@@ -579,7 +589,13 @@ async function initMic(){
     srcNode=audioCtx.createMediaStreamSource(mediaStream);
     workletNode=new AudioWorkletNode(audioCtx,"pcm16k");
     workletNode.port.onmessage=e=>{
-      if(capturing&&wsReady)ws.send(e.data);
+      if(capturing&&wsReady){ ws.send(e.data); if(autoTurn)autoStopCheck(e.data); }
+      else{
+        const sh=wakeShouldStream();
+        if(sh&&!wakeStreaming)wakeWs.send('{"type":"reset"}');   // fresh buffers each time we resume
+        wakeStreaming=sh;
+        if(sh)wakeWs.send(e.data);
+      }
       // level meter
       const a=new Int16Array(e.data); let s=0;
       for(let i=0;i<a.length;i+=8)s+=Math.abs(a[i]);
@@ -592,22 +608,119 @@ async function initMic(){
 }
 
 /* ============================== talk flow ========================== */
-async function toggleTalk(){
-  if(!wsReady){addMsg("sys","voice server offline");return}
-  if(capturing){ // stop talking
-    capturing=false;
-    ws.send(JSON.stringify({type:"stop"}));
-    $("talkBtn").textContent="ENGAGE VOICE"; $("micState").textContent="ready"; $("levelBar").style.width="0%";
-    setState("thinking","PROCESSING");
-    return;
-  }
+async function startTalk(auto){
   try{await initMic()}catch(err){addMsg("sys","mic blocked: "+err.message);return}
   stopPlayback();                       // barge-in
   audioArrived=false;
   ws.send(JSON.stringify({type:"start",sample_rate:16000,format:"pcm_s16le",channels:1,conversation:CONV}));
   capturing=true;
+  autoTurn=auto?{start:performance.now(),heard:false,quiet:0}:null;
   $("talkBtn").textContent="■ STOP & SEND"; $("micState").textContent="LIVE";
-  setState("listening","LISTENING","CLICK AGAIN TO SEND");
+  setState("listening","LISTENING",auto?"GO AHEAD — SENDS WHEN YOU PAUSE":"CLICK AGAIN TO SEND");
+}
+function endCapture(){
+  capturing=false; autoTurn=null;
+  $("talkBtn").textContent="ENGAGE VOICE"; $("micState").textContent=wakeArmed?"wake armed":"ready"; $("levelBar").style.width="0%";
+}
+function stopTalk(){
+  endCapture();
+  ws.send(JSON.stringify({type:"stop"}));
+  setState("thinking","PROCESSING");
+}
+function cancelTalk(){
+  endCapture();
+  ws.send(JSON.stringify({type:"cancel"}));
+  setState("standby","STANDBY",wakeArmed?"SAY “HEY JARVIS”":"");
+  addMsg("sys","(nothing heard after the wake word)");
+}
+async function toggleTalk(){
+  if(!wsReady){addMsg("sys","voice server offline");return}
+  if(capturing){stopTalk();return}
+  await startTalk(false);
+}
+function autoStopCheck(buf){
+  const a=new Int16Array(buf); let s2=0;
+  for(let i=0;i<a.length;i++)s2+=a[i]*a[i];
+  const rms=Math.sqrt(s2/Math.max(1,a.length));
+  const t=performance.now()-autoTurn.start;
+  if(t<WAKE_IGNORE_MS)return;
+  if(rms>=WAKE_SPEECH_RMS){autoTurn.heard=true;autoTurn.quiet=0}
+  else if(autoTurn.heard){autoTurn.quiet+=a.length/16; if(autoTurn.quiet>=WAKE_SILENCE_MS){stopTalk();return}}
+  if(!autoTurn.heard&&t>=WAKE_NO_SPEECH_MS){cancelTalk();return}
+  if(t>=WAKE_MAX_MS)stopTalk();
+}
+
+/* ============================== wake word ========================== */
+function wakePref(v){
+  try{ if(v===undefined)return localStorage.getItem("jarvisWake")==="1"; localStorage.setItem("jarvisWake",v?"1":"0"); }
+  catch{ return false }
+}
+function wakeUrl(){return (location.protocol==="https:"?"wss://":"ws://")+location.host+"/wake"}
+function wakeShouldStream(){
+  return wakeArmed&&wakeOpen&&wakeWs&&wakeWs.readyState===1&&!capturing&&state==="standby"&&activeSources.length===0;
+}
+function wakeUi(){
+  const b=$("wakeBtn");
+  b.textContent=!wakeArmed?"○ WAKE WORD: OFF":wakeOpen?"◉ WAKE WORD: ON — SAY “HEY JARVIS”":"◌ WAKE WORD: CONNECTING…";
+  b.classList.toggle("on",wakeArmed);
+  if(!capturing)$("micState").textContent=wakeArmed&&wakeOpen?"wake armed":(mediaStream?"ready":"idle");
+}
+function connectWake(){
+  if(!wakeArmed)return;
+  wakeOpen=false; wakeStreaming=false;
+  wakeWs=new WebSocket(wakeUrl()); wakeWs.binaryType="arraybuffer";
+  wakeWs.onmessage=ev=>{
+    let e; try{e=JSON.parse(ev.data)}catch{return}
+    if(e.type==="wake_ready"){ wakeOpen=true; wakeFails=0; wakeUi(); if(state==="standby")$("stateHint").textContent="SAY “HEY JARVIS”"; }
+    else if(e.type==="wake_error"){ addMsg("sys",e.message); disarmWake(); }
+    else if(e.type==="wake")onWake(e.score);
+  };
+  wakeWs.onclose=ev=>{
+    const wasOpen=wakeOpen; wakeOpen=false; wakeStreaming=false; wakeUi();
+    if(!wakeArmed||ev.code===4500)return;
+    if(!wasOpen&&++wakeFails>=5){ addMsg("sys","wake word: can't reach the server (check the token / server log)"); disarmWake(); return; }
+    setTimeout(connectWake,3000);
+  };
+  wakeWs.onerror=()=>{};
+  wakeUi();
+}
+async function armWake(){
+  if(!wsReady){addMsg("sys","voice server offline");return}
+  try{await initMic()}catch(err){addMsg("sys","mic blocked: "+err.message);return}
+  wakeArmed=true; wakeFails=0; wakePref(true); connectWake();
+  addMsg("sys","wake word on — say “Hey Jarvis”. Keep this tab open.");
+}
+function disarmWake(){
+  wakeArmed=false; wakePref(false); wakeOpen=false; wakeStreaming=false;
+  if(wakeWs){ try{wakeWs.close()}catch{} wakeWs=null; }
+  wakeUi();
+  if(state==="standby")$("stateHint").textContent="";
+}
+function wakeBeep(){
+  try{
+    ensureCtx();
+    const o=audioCtx.createOscillator(), g=audioCtx.createGain(), t=audioCtx.currentTime;
+    o.frequency.value=880; g.gain.setValueAtTime(0.0001,t);
+    g.gain.exponentialRampToValueAtTime(0.18,t+0.02); g.gain.exponentialRampToValueAtTime(0.0001,t+0.16);
+    o.connect(g); g.connect(audioCtx.destination); o.start(t); o.stop(t+0.18);
+  }catch{}
+}
+function onWake(score){
+  if(!wakeArmed||capturing||!wsReady||state!=="standby")return;
+  wakeStreaming=false;
+  wakeBeep();
+  startTalk(true);
+}
+$("wakeBtn").onclick=()=>wakeArmed?disarmWake():armWake();
+// Browsers need one click before the mic/audio can start: re-arm on the first interaction
+if(wakePref()){
+  $("wakeBtn").textContent="◌ WAKE WORD: CLICK ANYWHERE TO RESUME";
+  const resume=ev=>{
+    removeEventListener("pointerdown",resume,true); removeEventListener("keydown",resume,true);
+    if(ev.target&&ev.target.id==="wakeBtn")return;      // the button's own handler takes it
+    if(!wakeArmed)armWake();
+  };
+  addEventListener("pointerdown",resume,true); addEventListener("keydown",resume,true);
 }
 $("talkBtn").onclick=toggleTalk;
 $("reactorWrap").onclick=toggleTalk;
