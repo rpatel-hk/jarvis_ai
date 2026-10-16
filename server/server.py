@@ -168,6 +168,43 @@ class TurnTiming:
         return round(end - start, 4)
 
 
+# ============================================================== Piper (local TTS)
+# Free, offline voice used as a fallback when ElevenLabs refuses (quota, auth,
+# network), or as the main voice with voice.provider: piper.
+
+_PIPER_LOCK = threading.Lock()        # guards loading
+_PIPER_SYNTH_LOCK = threading.Lock()  # one synthesis at a time
+_PIPER_CACHE: dict = {}
+
+
+def _piper_voice(model_path: str):
+    path = Path(model_path).expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
+    key = str(path)
+    with _PIPER_LOCK:
+        if key not in _PIPER_CACHE:
+            from piper import PiperVoice  # optional dependency
+            _PIPER_CACHE[key] = PiperVoice.load(key)
+        return _PIPER_CACHE[key]
+
+
+def _pcm16k(samples: np.ndarray, rate: int) -> bytes:
+    """int16 mono at any rate -> int16 mono at 16 kHz (what the HUD plays)."""
+    if rate == 16000:
+        return samples.astype(np.int16).tobytes()
+    try:
+        from math import gcd
+        from scipy.signal import resample_poly
+        g = gcd(16000, rate)
+        out = resample_poly(samples.astype(np.float32), 16000 // g, rate // g)
+    except Exception:
+        n = int(round(len(samples) * 16000 / rate))
+        out = np.interp(np.linspace(0, len(samples) - 1, num=n),
+                        np.arange(len(samples)), samples.astype(np.float32))
+    return np.clip(out, -32768, 32767).astype(np.int16).tobytes()
+
+
 # ===================================================================== Hermes
 
 
@@ -434,7 +471,54 @@ class VoicePipelineServer:
 
     # ------------------------------------------------------------------ TTS
 
+    _eleven_down_until = 0.0   # monotonic time until which ElevenLabs is skipped
+
     def tts_chunks_sync(self, text: str, timing: TurnTiming) -> Iterator[bytes]:
+        voice = self.cfg["voice"]
+        fb = voice.get("fallback") or {}
+        if voice.get("provider", "elevenlabs") == "piper":
+            yield from self._piper_chunks(text, timing, voice.get("piper") or fb)
+            return
+        use_fb = bool(fb.get("model"))
+        if use_fb and time.monotonic() < self._eleven_down_until:
+            yield from self._piper_chunks(text, timing, fb)
+            return
+        gen = self._eleven_chunks(text, timing)
+        try:
+            try:
+                first = next(gen)  # ElevenLabs refusals surface here, before any audio
+            except StopIteration:
+                return
+            except Exception as exc:
+                if not use_fb:
+                    raise
+                wait = float(fb.get("retry_after_seconds", 600))
+                type(self)._eleven_down_until = time.monotonic() + wait
+                print(f"ElevenLabs unavailable ({str(exc)[:160]}); using Piper for {wait:.0f}s", flush=True)
+                timing.errors.append(f"tts_fallback: {str(exc)[:200]}")
+                yield from self._piper_chunks(text, timing, fb)
+                return
+            yield first
+            yield from gen
+        finally:
+            gen.close()
+
+    def _piper_chunks(self, text: str, timing: TurnTiming, cfg: dict) -> Iterator[bytes]:
+        model = cfg.get("model")
+        if not model:
+            raise RuntimeError("Piper voice not configured (set voice.fallback.model)")
+        timing.tts_model = f"piper:{Path(model).stem}"
+        timing.tts_request_start_monotonic = timing.tts_request_start_monotonic or time.perf_counter()
+        piper_voice = _piper_voice(model)
+        with _PIPER_SYNTH_LOCK:  # synthesize the whole sentence, then stream it
+            parts = [_pcm16k(c.audio_int16_array, c.sample_rate) for c in piper_voice.synthesize(text)]
+        pcm = b"".join(parts)
+        for i in range(0, len(pcm), 4096):
+            if timing.first_tts_audio_byte_monotonic is None:
+                timing.first_tts_audio_byte_monotonic = time.perf_counter()
+            yield pcm[i:i + 4096]
+
+    def _eleven_chunks(self, text: str, timing: TurnTiming) -> Iterator[bytes]:
         voice = self.cfg["voice"]
         key = os.environ.get("ELEVENLABS_API_KEY") or os.environ.get("ELEVEN_API_KEY") or os.environ.get("XI_API_KEY")
         if not key:
@@ -665,7 +749,19 @@ async def warm_pipeline() -> None:
         except Exception as exc:
             print(f"STT warm failed (remote STT still available): {exc}", flush=True)
 
+    async def warm_piper() -> None:
+        voice = CFG.get("voice") or {}
+        cfg = (voice.get("piper") if voice.get("provider") == "piper" else None) or voice.get("fallback") or {}
+        if not cfg.get("model"):
+            return
+        try:
+            await asyncio.to_thread(_piper_voice, cfg["model"])
+            print(f"Piper voice loaded ({cfg['model']}).", flush=True)
+        except Exception as exc:
+            print(f"Piper voice not available: {type(exc).__name__}: {exc}", flush=True)
+
     asyncio.get_running_loop().create_task(warm())
+    asyncio.get_running_loop().create_task(warm_piper())
 
 
 _WARM_STARTED = False

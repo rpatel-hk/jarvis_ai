@@ -74,6 +74,10 @@ voice:
   voice_name: "Your chosen voice"
   voice_id: YOUR_ELEVENLABS_VOICE_ID
   output_format: pcm_16000
+  fallback:                  # local Piper voice when ElevenLabs refuses (linux/install-piper.sh)
+    model: voices/en_GB-alan-medium.onnx
+    retry_after_seconds: 600   # how long to stay on Piper before trying ElevenLabs again
+  # provider: piper            # uncomment to use Piper as the ONLY voice (free, offline)
 
 persona:                     # used only by the anthropic fallback path
   system_prompt: >
