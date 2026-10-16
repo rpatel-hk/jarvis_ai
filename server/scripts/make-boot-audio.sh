@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-time generation of the boot greeting audio via ElevenLabs (~110 characters total)
-set -euo pipefail
+set -u
 
 cd "$(dirname "$0")/.."
 mkdir -p hud/audio
